@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData">
+    <serverData>
+      <paths name="jack@baker1.dsrg.utoronto.ca:22">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$/app" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="jack@baker2.dsrg.utoronto.ca:22">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$/app" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="jack@baker3.dsrg.utoronto.ca:22">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$/app" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="jack@baker4.dsrg.utoronto.ca:22">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$/app" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="jack@baker7.dsrg.utoronto.ca:22">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$/app" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="jack@baker8.dsrg.utoronto.ca:22">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$/app" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+  </component>
+</project>

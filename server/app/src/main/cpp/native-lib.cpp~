@@ -1,0 +1,515 @@
+#include <jni.h>
+
+#include <android/log.h>
+//#include <android/sharedmem.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/ashmem.h>
+#include <string>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <sstream>
+
+
+// Android log function wrappers
+static const char *kTAG = "ServerIPC";
+#define LOGI(...) \
+  ((void)__android_log_print(ANDROID_LOG_INFO, kTAG, __VA_ARGS__))
+#define LOGW(...) \
+  ((void)__android_log_print(ANDROID_LOG_WARN, kTAG, __VA_ARGS__))
+#define LOGE(...) \
+  ((void)__android_log_print(ANDROID_LOG_ERROR, kTAG, __VA_ARGS__))
+
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_stringFromJNI(
+        JNIEnv* env,
+        jobject /* this */) {
+    std::string hello = "Hello from C++";
+    return env->NewStringUTF(hello.c_str());
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemServer(JNIEnv *env, jobject thiz) {
+
+    // Create a ashmem region size of 8 bytes (enough for one int64_t timestamp value)
+    const int numAshmemFds = 1;
+    int ashmemFds[numAshmemFds];
+
+    const int ashmemSz = sizeof(int64_t);
+    std::string debugAshmemName = "abc_test";   // Name doesn't matter, useful for debugging only
+
+    // Create shared memory using API, can't get it working in NDK API < 28
+//    ashmemFds[0] = ASharedMemory_create(debugAshmemName.c_str(), ashmem_size);
+
+    // Create android shared memory with the old fashioned way
+    ashmemFds[0] = open("/dev/ashmem", O_RDWR);
+    ioctl(ashmemFds[0], ASHMEM_SET_NAME, debugAshmemName.c_str());
+    ioctl(ashmemFds[0], ASHMEM_SET_SIZE, ashmemSz);
+    LOGE("ashmemFd[0]: %d", ashmemFds[0]);
+
+
+    // Create, bind and listen to a UNIX domain socket with abstract namespace
+    struct sockaddr_un serverSocketAddr;
+    memset(&serverSocketAddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
+    serverSocketAddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
+
+    // Abstract namespace must lead with '\0'.
+    // Since we don't need to maintain the socket file, there's no need to unlink afterwards
+    // http://www.toptip.ca/2013/01/unix-domain-socket-with-abstract-socket.html?m=1
+    char domainSocketName[sizeof(serverSocketAddr.sun_path)];
+    memcpy(&domainSocketName[0], "\0", 1);
+    strcpy(&domainSocketName[1], "nanotrace_socket");
+    strncpy(serverSocketAddr.sun_path, domainSocketName, sizeof(serverSocketAddr.sun_path) - 1);
+
+    int ret;
+
+    int serverDomainSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (serverDomainSocket < 0) {
+        LOGE("socket: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    ret = bind(serverDomainSocket, (const struct sockaddr *) &serverSocketAddr, sizeof(struct sockaddr_un));
+    if (ret < 0) {
+        LOGE("socket bind: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    ret = listen(serverDomainSocket, 8);
+    if (ret < 0) {
+        LOGE("socket listen: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // For all incoming connections, send the ashmemFd with a SCM_RIGHTS ancillary message
+    // http://man7.org/linux/man-pages/man7/unix.7.html
+    int clientDomainSocket;
+    while(true) {
+        // Generate ancillary message
+        char iovBuf[1];
+        struct iovec iov = {
+            .iov_base = iovBuf,
+            .iov_len = sizeof(iovBuf)
+        };
+        union {   /* Ancillary data buffer, wrapped in a union
+                 in order to ensure it is suitably aligned */
+            char buf[CMSG_SPACE(sizeof(ashmemFds))];
+            struct cmsghdr align;
+        } control;
+        struct msghdr msg = {
+            .msg_iov = &iov,
+            .msg_iovlen = 1,
+            .msg_control = control.buf,
+            .msg_controllen = sizeof(control.buf)
+        };
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int) * numAshmemFds);
+        memcpy(CMSG_DATA(cmsg), ashmemFds, numAshmemFds * sizeof(int));
+
+        // Send ashmemFd to client
+        clientDomainSocket = accept(serverDomainSocket, NULL, NULL);
+        if (clientDomainSocket < 0) {
+            LOGE("accept: %s", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        do {
+            ret = sendmsg(clientDomainSocket, &msg, 0);
+        } while (ret == -1 && errno == EINTR);
+        if (ret == -1) {
+            ret = errno;
+            LOGE("Error writing ashmem handle to socket: error %#x (%s)",
+                 ret, strerror(ret));
+            // Add error return?
+        }
+        LOGE("Sent client ashmemFDs");
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemWriteTimestampNative(JNIEnv *env, jobject thiz) {
+    // Connect to the domain socket server
+    struct sockaddr_un serverSocketAddr;
+    memset(&serverSocketAddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
+    serverSocketAddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
+
+    // Abstract namespace must lead with '\0'.
+    // Since we don't need to maintain the socket file, there's no need to unlink afterwards
+    // http://www.toptip.ca/2013/01/unix-domain-socket-with-abstract-socket.html?m=1
+    char domainSocketName[sizeof(serverSocketAddr.sun_path)];
+    memcpy(&domainSocketName[0], "\0", 1);
+    strcpy(&domainSocketName[1], "nanotrace_socket");
+    strncpy(serverSocketAddr.sun_path, domainSocketName, sizeof(serverSocketAddr.sun_path) - 1);
+
+    int ret;
+    int serverDomainSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    ret = connect(serverDomainSocket, (const struct sockaddr*) &serverSocketAddr,
+                  sizeof(struct sockaddr_un));
+    if (ret < 0) {
+        LOGE("server connect: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // Receive ashmemFds via SCM_RIGHTS ancillary message
+    // http://man7.org/linux/man-pages/man7/unix.7.html
+    static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
+    char* kMessageBuf = new char[kMessageBufferSize];
+    struct iovec iov[1];
+    iov[0].iov_base = kMessageBuf;
+    iov[0].iov_len = kMessageBufferSize;
+
+    const int numAshmemFds = 1;
+    char fdBuf[CMSG_SPACE(numAshmemFds)];
+
+    struct msghdr msg = {
+            .msg_control = fdBuf,
+            .msg_controllen = sizeof(fdBuf),
+            .msg_iov = &iov[0],
+            .msg_iovlen = 1,
+    };
+
+    do {
+        ret = recvmsg(serverDomainSocket, &msg, 0);
+    } while (ret == -1 && errno == EINTR);
+    if (ret == -1) {
+        ret = errno;
+        LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
+        exit(EXIT_FAILURE);
+    }
+
+//    if (msg.msg_iovlen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad data length");
+//        exit(EXIT_FAILURE);
+//    }
+//    if (msg.msg_controllen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad fd length");
+//        exit(EXIT_FAILURE);
+//    }
+
+    size_t dataLen = msg.msg_iov[0].iov_len;
+    const void *data = static_cast<const void *>(msg.msg_iov[0].iov_base);
+    if (!data) {
+        LOGE("Error reading ashmem handle to socket: no buffer data");
+        exit(EXIT_FAILURE);
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg) {
+        LOGE("Error reading ashmem handle to socket: no fd header");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t fdCount = msg.msg_controllen >> 2;
+    const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+    if (!ashmemFds) {
+        LOGE("Error reading ashmem handle to socket: no fd data");
+        exit(EXIT_FAILURE);
+    }
+    LOGE("Received ashmemFd: %d", ashmemFds[0]);
+
+    const int ashmemSz = sizeof(int64_t);
+    int64_t *shared_buffer = (int64_t *) mmap(NULL, ashmemSz, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                              ashmemFds[0], 0);
+
+    // Obtain the timestamp specified in Java and write to the shared memory buffer
+    jclass MainActivityClass = env->GetObjectClass(thiz);
+    jfieldID field_timestamp = env->GetFieldID(MainActivityClass, "timestamp", "J");
+    jlong timestamp = env->GetLongField(thiz, field_timestamp);
+    shared_buffer[0] = timestamp;
+    std::ostringstream os;
+    os << "Wrote timestamp to ashmem: " << timestamp;
+    const char* log = os.str().c_str();
+    LOGE("%s", log);
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemReadTimestampNative(JNIEnv *env, jobject thiz) {
+    // Connect to the domain socket server
+    struct sockaddr_un serverSocketAddr;
+    memset(&serverSocketAddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
+    serverSocketAddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
+
+    // Abstract namespace must lead with '\0'.
+    // Since we don't need to maintain the socket file, there's no need to unlink afterwards
+    // http://www.toptip.ca/2013/01/unix-domain-socket-with-abstract-socket.html?m=1
+    char domainSocketName[sizeof(serverSocketAddr.sun_path)];
+    memcpy(&domainSocketName[0], "\0", 1);
+    strcpy(&domainSocketName[1], "nanotrace_socket");
+    strncpy(serverSocketAddr.sun_path, domainSocketName, sizeof(serverSocketAddr.sun_path) - 1);
+
+    int ret;
+    int serverDomainSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    ret = connect(serverDomainSocket, (const struct sockaddr*) &serverSocketAddr,
+            sizeof(struct sockaddr_un));
+    if (ret < 0) {
+        LOGE("server connect: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // Receive ashmemFds via SCM_RIGHTS ancillary message
+    // http://man7.org/linux/man-pages/man7/unix.7.html
+    static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
+    char* kMessageBuf = new char[kMessageBufferSize];
+    struct iovec iov[1];
+    iov[0].iov_base = kMessageBuf;
+    iov[0].iov_len = kMessageBufferSize;
+
+    const int numAshmemFds = 1;
+    char fdBuf[CMSG_SPACE(numAshmemFds)];
+
+    struct msghdr msg = {
+        .msg_control = fdBuf,
+        .msg_controllen = sizeof(fdBuf),
+        .msg_iov = &iov[0],
+        .msg_iovlen = 1,
+    };
+
+    do {
+        ret = recvmsg(serverDomainSocket, &msg, 0);
+    } while (ret == -1 && errno == EINTR);
+    if (ret == -1) {
+        ret = errno;
+        LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
+        exit(EXIT_FAILURE);
+    }
+
+//    if (msg.msg_iovlen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad data length");
+//        exit(EXIT_FAILURE);
+//    }
+//    if (msg.msg_controllen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad fd length");
+//        exit(EXIT_FAILURE);
+//    }
+
+    size_t dataLen = msg.msg_iov[0].iov_len;
+    const void *data = static_cast<const void *>(msg.msg_iov[0].iov_base);
+    if (!data) {
+        LOGE("Error reading ashmem handle to socket: no buffer data");
+        exit(EXIT_FAILURE);
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg) {
+        LOGE("Error reading ashmem handle to socket: no fd header");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t fdCount = msg.msg_controllen >> 2;
+    const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+    if (!ashmemFds) {
+        LOGE("Error reading ashmem handle to socket: no fd data");
+        exit(EXIT_FAILURE);
+    }
+    LOGE("Received ashmemFd: %d", ashmemFds[0]);
+
+
+    const int ashmemSz = sizeof(int64_t);
+    long* shared_buffer = (long *) mmap(NULL, ashmemSz, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                              ashmemFds[0], 0);
+    LOGE("Read timestamp from ashmem: %lld", std::to_string(shared_buffer[0]).c_str());
+    std::string timestamp_str = std::to_string(shared_buffer[0]);
+    return env->NewStringUTF(timestamp_str.c_str());
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_getAshmemFdNative(JNIEnv *env, jobject thiz) {
+    // Connect to the domain socket server
+    struct sockaddr_un serverSocketAddr;
+    memset(&serverSocketAddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
+    serverSocketAddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
+
+    // Abstract namespace must lead with '\0'.
+    // Since we don't need to maintain the socket file, there's no need to unlink afterwards
+    // http://www.toptip.ca/2013/01/unix-domain-socket-with-abstract-socket.html?m=1
+    char domainSocketName[sizeof(serverSocketAddr.sun_path)];
+    memcpy(&domainSocketName[0], "\0", 1);
+    strcpy(&domainSocketName[1], "nanotrace_socket");
+    strncpy(serverSocketAddr.sun_path, domainSocketName, sizeof(serverSocketAddr.sun_path) - 1);
+
+    int ret;
+    int serverDomainSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    ret = connect(serverDomainSocket, (const struct sockaddr*) &serverSocketAddr,
+                  sizeof(struct sockaddr_un));
+    if (ret < 0) {
+        LOGE("server connect: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // Receive ashmemFds via SCM_RIGHTS ancillary message
+    // http://man7.org/linux/man-pages/man7/unix.7.html
+    static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
+    char* kMessageBuf = new char[kMessageBufferSize];
+    struct iovec iov[1];
+    iov[0].iov_base = kMessageBuf;
+    iov[0].iov_len = kMessageBufferSize;
+
+    const int numAshmemFds = 1;
+    char fdBuf[CMSG_SPACE(numAshmemFds)];
+
+    struct msghdr msg = {
+            .msg_control = fdBuf,
+            .msg_controllen = sizeof(fdBuf),
+            .msg_iov = &iov[0],
+            .msg_iovlen = 1,
+    };
+
+    do {
+        ret = recvmsg(serverDomainSocket, &msg, 0);
+    } while (ret == -1 && errno == EINTR);
+    if (ret == -1) {
+        ret = errno;
+        LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
+        exit(EXIT_FAILURE);
+    }
+
+//    if (msg.msg_iovlen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad data length");
+//        exit(EXIT_FAILURE);
+//    }
+//    if (msg.msg_controllen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad fd length");
+//        exit(EXIT_FAILURE);
+//    }
+
+    size_t dataLen = msg.msg_iov[0].iov_len;
+    const void *data = static_cast<const void *>(msg.msg_iov[0].iov_base);
+    if (!data) {
+        LOGE("Error reading ashmem handle to socket: no buffer data");
+        exit(EXIT_FAILURE);
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg) {
+        LOGE("Error reading ashmem handle to socket: no fd header");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t fdCount = msg.msg_controllen >> 2;
+    const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+    if (!ashmemFds) {
+        LOGE("Error reading ashmem handle to socket: no fd data");
+        exit(EXIT_FAILURE);
+    }
+    LOGE("Received ashmemFd: %d", ashmemFds[0]);
+
+    return ashmemFds[0];
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_getAshmemJavaFd(JNIEnv *env, jobject thiz) {
+    // Connect to the domain socket server
+    struct sockaddr_un serverSocketAddr;
+    memset(&serverSocketAddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
+    serverSocketAddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
+
+    // Abstract namespace must lead with '\0'.
+    // Since we don't need to maintain the socket file, there's no need to unlink afterwards
+    // http://www.toptip.ca/2013/01/unix-domain-socket-with-abstract-socket.html?m=1
+    char domainSocketName[sizeof(serverSocketAddr.sun_path)];
+    memcpy(&domainSocketName[0], "\0", 1);
+    strcpy(&domainSocketName[1], "nanotrace_socket");
+    strncpy(serverSocketAddr.sun_path, domainSocketName, sizeof(serverSocketAddr.sun_path) - 1);
+
+    int ret;
+    int serverDomainSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    ret = connect(serverDomainSocket, (const struct sockaddr *) &serverSocketAddr,
+                  sizeof(struct sockaddr_un));
+    if (ret < 0) {
+        LOGE("server connect: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    // Receive ashmemFds via SCM_RIGHTS ancillary message
+    // http://man7.org/linux/man-pages/man7/unix.7.html
+    static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
+    char *kMessageBuf = new char[kMessageBufferSize];
+    struct iovec iov[1];
+    iov[0].iov_base = kMessageBuf;
+    iov[0].iov_len = kMessageBufferSize;
+
+    const int numAshmemFds = 1;
+    char fdBuf[CMSG_SPACE(numAshmemFds)];
+
+    struct msghdr msg = {
+            .msg_control = fdBuf,
+            .msg_controllen = sizeof(fdBuf),
+            .msg_iov = &iov[0],
+            .msg_iovlen = 1,
+    };
+
+    do {
+        ret = recvmsg(serverDomainSocket, &msg, 0);
+    } while (ret == -1 && errno == EINTR);
+    if (ret == -1) {
+        ret = errno;
+        LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
+        exit(EXIT_FAILURE);
+    }
+
+//    if (msg.msg_iovlen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad data length");
+//        exit(EXIT_FAILURE);
+//    }
+//    if (msg.msg_controllen != 1) {
+//        LOGE("Error reading ashmem handle to socket: bad fd length");
+//        exit(EXIT_FAILURE);
+//    }
+
+    size_t dataLen = msg.msg_iov[0].iov_len;
+    const void *data = static_cast<const void *>(msg.msg_iov[0].iov_base);
+    if (!data) {
+        LOGE("Error reading ashmem handle to socket: no buffer data");
+        exit(EXIT_FAILURE);
+    }
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg) {
+        LOGE("Error reading ashmem handle to socket: no fd header");
+        exit(EXIT_FAILURE);
+    }
+
+    size_t fdCount = msg.msg_controllen >> 2;
+    const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
+    if (!ashmemFds) {
+        LOGE("Error reading ashmem handle to socket: no fd data");
+        exit(EXIT_FAILURE);
+    }
+    LOGE("Received ashmemFd: %d", ashmemFds[0]);
+
+
+    // Note the only reason for doing this is because it seems like we cannot call
+    // "public final void setInt$(int fd)" and still compile in android studio
+    // We could however execute it in debug mode ... no idea why
+
+    jclass fileDescriptorClass = env->FindClass("java/io/FileDescriptor");
+    if (fileDescriptorClass == NULL) {
+        return NULL;
+    }
+
+    // Construct a new FileDescriptor
+    jmethodID fileDescriptorInitMethodId = env->GetMethodID(fileDescriptorClass, "<init>", "()V");
+    if (fileDescriptorInitMethodId == NULL) {
+        return NULL;
+    }
+    jobject returnObj = env->NewObject(fileDescriptorClass, fileDescriptorInitMethodId);
+
+    // Poke the "fd" field with the file descriptor. Android renamed "fd" to "descriptor"
+    jfieldID descriptorFieldId = env->GetFieldID(fileDescriptorClass, "descriptor", "I");
+    if (descriptorFieldId == NULL) {
+        return NULL;
+    }
+    env->SetIntField(returnObj, descriptorFieldId, (jint) ashmemFds[0]);
+
+    return returnObj;
+}
