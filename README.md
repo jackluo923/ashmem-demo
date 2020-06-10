@@ -9,7 +9,7 @@ it is able to access the shared memory region via JNI or directly in JAVA using 
 1. Creates shared memory region using ashmem
 2. Creates Unix Domain Socket server to share ashmem file descriptor
 
-   - Note: targetSdkVersion 26 in build.gradle must be set to <= 28, device SDK API version can be higher.
+   - Note: targetSdkVersion in build.gradle must be set to <= 27, device SDK API version can be higher.
   
 3. Creates Binder service to share ashmem file descriptor
 4. Set and Get shared memory value
@@ -29,9 +29,6 @@ it is able to access the shared memory region via JNI or directly in JAVA using 
 
 ### Binder Client
 1. Connects to Binder service implemented in Server
-
-   - Note: targetSdkVersion in build.gradle must be <= 28 to work, device SDK API version can be higher.
-
 2. Obtains shared memory file descriptor and map shared memory region
 3. Reads shared memory value in native via JNI
 4. Reads shared memory value in Java's Direct Mapped Byte Buffer (stays in Java and avoids crossing JNI boundry)
