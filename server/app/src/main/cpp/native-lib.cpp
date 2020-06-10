@@ -65,8 +65,8 @@ Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_createSharedMemoryRegionNa
     jclass fileDescriptorClass = env->FindClass("java/io/FileDescriptor");
     jmethodID fileDescriptorInitMethodId = env->GetMethodID(fileDescriptorClass, "<init>", "()V");
     jobject mSharedMemoryFd = env->NewObject(fileDescriptorClass, fileDescriptorInitMethodId);
-    char disriptorFieldName[] = "descriptor";   // Note: Android renamed "fd" to "descriptor"
-    jfieldID descriptorFieldId = env->GetFieldID(fileDescriptorClass, disriptorFieldName, "I");
+    char discriptorFieldName[] = "descriptor";   // Note: Android renamed "fd" to "descriptor"
+    jfieldID descriptorFieldId = env->GetFieldID(fileDescriptorClass, discriptorFieldName, "I");
     env->SetIntField(mSharedMemoryFd, descriptorFieldId, (jint)sharedMemoryFd);
     env->SetStaticObjectField(MainActivityClass, mSharedMemoryFdFieldId, mSharedMemoryFd);
 }
