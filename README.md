@@ -77,10 +77,11 @@ final Class<?> directByteBufferClass = Class.forName("java.nio.DirectByteBuffer"
 final Constructor<?> directByteBufferConstructor = directByteBufferClass.getConstructor(int.class,
                         long.class, FileDescriptor.class, Runnable.class, boolean.class);
 MappedByteBuffer directMappedByteBuffer = (MappedByteBuffer)directByteBufferConstructor.newInstance(
-   <shared memory size>, <memory mapped shared memory return address>, <shared memory FileDescriptor object>, null, <Map mode>);
+   <shared memory size>, <memory mapped shared memory return address>, 
+   <shared memory FileDescriptor object>, null, <Map mode>);
 ```
 Normally accessing hidden API using reflection is restricted. This restriction can be bypassed using a brilliant work called ["ChickenHook"](https://androidreverse.wordpress.com/2020/05/02/android-api-restriction-bypass-for-all-android-versions/
-)
+).
 
 #### Working With File Descriptor Shared Via Unix Domain Socket
 Unlike FileDescriptor object shared across Binder service via ParcelFileDescriptor, the file descriptor shared across Unix Domain Socket is a simple integer file descriptor in native. To convert integer file descriptor to a Java FileDescriptor object, we can play some tricks inside JNI which bypass Java's access restrictions. We first need to create a java FileDescriptor object, then we manually set the private integer file descriptor via JNI. The code to do this is below:
