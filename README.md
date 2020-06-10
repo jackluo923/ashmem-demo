@@ -64,7 +64,7 @@ Android-10.0.0_r30 (API29) - FileChannelImpl.java - line: 950-954
 - https://cs.android.com/android/platform/superproject/+/android-10.0.0_r30:libcore/ojluni/src/main/java/sun/nio/ch/FileChannelImpl.java
 
 Android-8.0.0_r26 (API26) - FileChannelImpl.java - line: 931-939
-https://cs.android.com/android/platform/superproject/+/android-8.0.0_r26:libcore/ojluni/src/main/java/sun/nio/ch/FileChannelImpl.java
+- https://cs.android.com/android/platform/superproject/+/android-8.0.0_r26:libcore/ojluni/src/main/java/sun/nio/ch/FileChannelImpl.java
 
 #### Workaround
 The usual way of mapping a shared memory region to a shared memory file descriptor is the following:
