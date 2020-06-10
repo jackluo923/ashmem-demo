@@ -16,6 +16,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service android:name=".ShmFdSharingService">
+            <intent-filter>
+                <action android:name="ca.utoronto.dsrg.ashmem.demo.server.ShmFdSharingService"/>
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

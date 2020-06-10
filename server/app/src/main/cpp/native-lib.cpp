@@ -20,6 +20,10 @@
 #include <cstring>
 #include <sstream>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 // Android log function wrappers
 static const char *kTAG = "ServerIPC";
 #define LOGD(...) \
@@ -39,41 +43,42 @@ constexpr char DOMAIN_SOCKET_ABSTRACT_NAMESPACE[] = "\0ABSTRACT_NAMESPACE_NAME";
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemServer(JNIEnv *env, jobject thiz) {
-    // Obtain shared memory type: 1 -> ashmem, 2 -> AHardwarebuffer
-    jclass MainActivityClass = env->GetObjectClass(thiz);
-    jfieldID field_sharedMemoryType = env->GetFieldID(MainActivityClass, "sharedMemoryType", "I");
-    jint sharedMemoryType = env->GetIntField(thiz, field_sharedMemoryType);
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_createSharedMemoryRegionNative(JNIEnv *env, jobject thiz) {
+    LOGI("Creating ashmem region using ASharedMemory_create()");
+    int sharedMemoryFd = ASharedMemory_create(ASHMEM_REGION_NAME, NUM_SHARED_MEM_SIZE_BYTES);
+    int64_t* sharedBuffer =
+            (int64_t*)mmap(NULL, NUM_SHARED_MEM_SIZE_BYTES, PROT_WRITE, MAP_SHARED, sharedMemoryFd, 0);
 
-    int ashmemFds[NUM_SHARED_MEM_REGIONS] = {0};
-    AHardwareBuffer* aHardwareBuffer = nullptr;
-    if (sharedMemoryType == 1) {
-        // Obtain configuration of api usage: 1 -> use API <= 26, 2 -> use API >= 26
-        jfieldID field_useNewAPI = env->GetFieldID(MainActivityClass, "useNewAPI", "I");
-        jint useNewAPI = env->GetIntField(thiz, field_useNewAPI);
-        if (useNewAPI == 1) {
-            LOGD("Creating ashmem region using old method for API < 26");
-            ashmemFds[0] = open("/dev/ashmem", O_RDWR);
-            ioctl(ashmemFds[0], ASHMEM_SET_NAME, ASHMEM_REGION_NAME);
-            ioctl(ashmemFds[0], ASHMEM_SET_SIZE, NUM_SHARED_MEM_SIZE_BYTES);
-        } else {
-            LOGD("Creating ashmem region using new method for API >= 26");
-            ashmemFds[0] = ASharedMemory_create(ASHMEM_REGION_NAME, NUM_SHARED_MEM_SIZE_BYTES);
-        }
-        LOGD("Created ashmem region");
-    } else {
-        AHardwareBuffer_Desc hardwareBufferDesc = {
-                .width = static_cast<uint32_t>(NUM_SHARED_MEM_SIZE_BYTES),
-                .height = static_cast<uint32_t>(1),
-                .layers = static_cast<uint32_t>(1),
-                .format = AHARDWAREBUFFER_FORMAT_BLOB
-        };
-        int ret = AHardwareBuffer_allocate(&hardwareBufferDesc, &aHardwareBuffer);
-        if (0 != ret) {
-            LOGE("Failed to AHardwareBuffer_allocate");
-            exit(EXIT_FAILURE);
-        }
-    }
+    // Write share memory information to java member variables
+    LOGI("Populating shared memory metadata");
+    jclass MainActivityClass = env->GetObjectClass(thiz);
+    // Set mRawSharedMemoryPtr
+    jfieldID mRawSharedMemoryPtrFieldId =
+            env->GetStaticFieldID(MainActivityClass, "mRawSharedMemoryPtr", "J");
+    env->SetStaticLongField(MainActivityClass, mRawSharedMemoryPtrFieldId, (jlong)sharedBuffer);
+    // Set mRawSharedMemoryFd
+    jfieldID mRawSharedMemoryFdFieldId = env->GetStaticFieldID(MainActivityClass, "mRawSharedMemoryFd", "I");
+    env->SetStaticIntField(MainActivityClass, mRawSharedMemoryFdFieldId, (jint)sharedMemoryFd);
+    // Set mSharedMemoryFd
+    jfieldID mSharedMemoryFdFieldId =
+            env->GetStaticFieldID(MainActivityClass, "mSharedMemoryFd", "Ljava/io/FileDescriptor;");
+    jclass fileDescriptorClass = env->FindClass("java/io/FileDescriptor");
+    jmethodID fileDescriptorInitMethodId = env->GetMethodID(fileDescriptorClass, "<init>", "()V");
+    jobject mSharedMemoryFd = env->NewObject(fileDescriptorClass, fileDescriptorInitMethodId);
+    char disriptorFieldName[] = "descriptor";   // Note: Android renamed "fd" to "descriptor"
+    jfieldID descriptorFieldId = env->GetFieldID(fileDescriptorClass, disriptorFieldName, "I");
+    env->SetIntField(mSharedMemoryFd, descriptorFieldId, (jint)sharedMemoryFd);
+    env->SetStaticObjectField(MainActivityClass, mSharedMemoryFdFieldId, mSharedMemoryFd);
+}
+
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_domainSocketServerNative(JNIEnv *env, jobject thiz) {
+    // Prepare raw ashmemFds array for sharing across unix domain socket
+    jclass MainActivityClass = env->GetObjectClass(thiz);
+    jfieldID mRawSharedMemoryFdFieldId = env->GetStaticFieldID(MainActivityClass, "mRawSharedMemoryFd", "I");
+    int ashmemFds[NUM_SHARED_MEM_REGIONS] = {env->GetStaticIntField(MainActivityClass, mRawSharedMemoryFdFieldId)};
 
     // Create, bind and listen to a UNIX domain socket with abstract namespace
     // Note: Calculate the sockaddr_un stuct sizes carefully: https://stackoverflow.com/a/26361456/3747216
@@ -134,25 +139,17 @@ Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemServer(JNIEnv *env, 
             exit(EXIT_FAILURE);
         }
         LOGI("Accepted a new client on client socketFd %d", clientSocket);
-
         int ret = -1;
-        if (sharedMemoryType == 1) {
-            // For all incoming connections, send the ashmemFd with a SCM_RIGHTS ancillary message
-            // http://man7.org/linux/man-pages/man7/unix.7.html
-            do {
-                ret = sendmsg(clientSocket, &msg, 0);
-            } while (ret == -1 && errno == EINTR);
-            if (ret == -1) {
-                ret = errno;
-                LOGE("Error writing ashmem handle to socket: error %#x (%s)",
-                     ret, strerror(ret));
-                exit(EXIT_FAILURE);
-            }
-        } else {
-            ret = AHardwareBuffer_sendHandleToUnixSocket(aHardwareBuffer, clientSocket);
-            if (0 != ret) {
-                LOGE("Failed to AHardwareBuffer_sendHandleToUnixSocket");
-            }
+        // For all incoming connections, send the ashmemFd with a SCM_RIGHTS ancillary message
+        // http://man7.org/linux/man-pages/man7/unix.7.html
+        do {
+            ret = sendmsg(clientSocket, &msg, 0);
+        } while (ret == -1 && errno == EINTR);
+        if (ret == -1) {
+            ret = errno;
+            LOGE("Error writing ashmem handle to socket: error %#x (%s)",
+                 ret, strerror(ret));
+            exit(EXIT_FAILURE);
         }
         LOGI("Sent client the ashmemFDs via ancillary message");
     }
@@ -160,295 +157,21 @@ Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemServer(JNIEnv *env, 
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_sharedMemoryWriteValueNative(JNIEnv *env, jobject thiz) {
-    // Obtain shared memory type: 1 -> ashmem, 2 -> AHardwarebuffer
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_writeValueInSharedMemoryNative(JNIEnv *env, jobject thiz,
+                                                                                     jlong shared_memory_value) {
     jclass MainActivityClass = env->GetObjectClass(thiz);
-    jfieldID field_sharedMemoryType = env->GetFieldID(MainActivityClass, "sharedMemoryType", "I");
-    jint sharedMemoryType = env->GetIntField(thiz, field_sharedMemoryType);
-
-    // Configure unix domain socket
-    struct sockaddr_un socketaddr;
-    memset(&socketaddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
-    socketaddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
-    memcpy(&socketaddr.sun_path, DOMAIN_SOCKET_ABSTRACT_NAMESPACE, sizeof(DOMAIN_SOCKET_ABSTRACT_NAMESPACE) - 1);
-    int serverSocket = socket(AF_UNIX, SOCK_STREAM, 0);
-
-    // Connect to the specified unix domain socket
-    LOGD("Connect to the specified unix domain socket");
-    if (connect(serverSocket, (const struct sockaddr *) &socketaddr, sizeof(socketaddr.sun_family) +
-            sizeof(DOMAIN_SOCKET_ABSTRACT_NAMESPACE) - 1) < 0) {
-        LOGE("server connect: %s", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    void *shared_buffer = nullptr;
-    if (sharedMemoryType == 1) {
-        // Receive ashmemFds via SCM_RIGHTS ancillary message
-        // http://man7.org/linux/man-pages/man7/unix.7.html
-        static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
-        char *kMessageBuf = new char[kMessageBufferSize];
-        struct iovec iov[1];
-        iov[0].iov_base = kMessageBuf;
-        iov[0].iov_len = kMessageBufferSize;
-        const int numAshmemFds = 1;
-        char fdBuf[CMSG_SPACE(numAshmemFds)];
-        struct msghdr msg = {
-                .msg_control = fdBuf,
-                .msg_controllen = sizeof(fdBuf),
-                .msg_iov = &iov[0],
-                .msg_iovlen = 1,
-        };
-
-        int ret = -1;
-        do {
-            ret = recvmsg(serverSocket, &msg, 0);
-        } while (ret == -1 && errno == EINTR);
-        if (ret == -1) {
-            ret = errno;
-            LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
-            exit(EXIT_FAILURE);
-        }
-
-        if (msg.msg_iovlen != 1) {
-            LOGE("Error reading ashmem handle to socket: bad data length");
-            exit(EXIT_FAILURE);
-        }
-        if (msg.msg_controllen != sizeof(fdBuf)) {
-            LOGE("Error reading ashmem handle to socket: bad fdBuf length");
-            exit(EXIT_FAILURE);
-        }
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        if (!cmsg) {
-            LOGE("Error reading ashmem handle to socket: no fd header");
-            exit(EXIT_FAILURE);
-        }
-
-        const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
-        if (!ashmemFds) {
-            LOGE("Error reading ashmem handle to socket: no fd data");
-            exit(EXIT_FAILURE);
-        }
-        LOGE("Received ashmemFd: %d", ashmemFds[0]);
-
-        const int ashmemSz = sizeof(int64_t);
-        shared_buffer = mmap(NULL, ashmemSz, PROT_WRITE, MAP_SHARED, ashmemFds[0], 0);
-    } else {
-        AHardwareBuffer *h_buffer = nullptr;
-        int ret = AHardwareBuffer_recvHandleFromUnixSocket(serverSocket, &h_buffer);
-        if (ret != 0) {
-            LOGE("Failed to AHardwareBuffer_recvHandleFromUnixSocket");
-        }
-        ret = AHardwareBuffer_lock(h_buffer, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &shared_buffer);
-    }
-
-    // Obtain the value we want to write
-    jfieldID field_sharedMemoryValue = env->GetFieldID(MainActivityClass, "shared_memory_value", "J");
-    jlong shared_memory_value = env->GetLongField(thiz, field_sharedMemoryValue);
-
-    ((int64_t *) shared_buffer)[0] = shared_memory_value;
-    std::ostringstream os;
-    os << "Wrote " << shared_memory_value << " to shared memory";
-    const char *log = os.str().c_str();
-    LOGE("%s", log);
+    jfieldID mRawSharedMemoryPtrFieldId =
+            env->GetStaticFieldID(MainActivityClass, "mRawSharedMemoryPtr", "J");
+    int64_t* sharedBuffer = (int64_t*)env->GetStaticLongField(MainActivityClass, mRawSharedMemoryPtrFieldId);
+    sharedBuffer[0] = (int64_t)shared_memory_value;
 }
 
 extern "C"
-JNIEXPORT jstring JNICALL
-Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_ashmemReadTimestampNative(JNIEnv *env, jobject thiz) {
-    // Obtain shared memory type: 1 -> ashmem, 2 -> AHardwarebuffer
+JNIEXPORT jlong JNICALL
+Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_readValueInSharedMemoryNative(JNIEnv *env, jobject thiz) {
     jclass MainActivityClass = env->GetObjectClass(thiz);
-    jfieldID field_sharedMemoryType = env->GetFieldID(MainActivityClass, "sharedMemoryType", "I");
-    jint sharedMemoryType = env->GetIntField(thiz, field_sharedMemoryType);
-
-    // Configure unix domain socket
-    struct sockaddr_un socketaddr;
-    memset(&socketaddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
-    socketaddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
-    memcpy(&socketaddr.sun_path, DOMAIN_SOCKET_ABSTRACT_NAMESPACE, sizeof(DOMAIN_SOCKET_ABSTRACT_NAMESPACE) - 1);
-    int serverSocket = socket(AF_UNIX, SOCK_STREAM, 0);
-
-    // Connect to the specified unix domain socket
-    LOGD("Connect to the specified unix domain socket");
-    if (connect(serverSocket, (const struct sockaddr *) &socketaddr, sizeof(socketaddr.sun_family) +
-                                                                     sizeof(DOMAIN_SOCKET_ABSTRACT_NAMESPACE) - 1) <
-        0) {
-        LOGE("server connect: %s", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    void *shared_buffer = nullptr;
-    if (sharedMemoryType == 1) {
-        // Receive ashmemFds via SCM_RIGHTS ancillary message
-        // http://man7.org/linux/man-pages/man7/unix.7.html
-        static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
-        char *kMessageBuf = new char[kMessageBufferSize];
-        struct iovec iov[1];
-        iov[0].iov_base = kMessageBuf;
-        iov[0].iov_len = kMessageBufferSize;
-        const int numAshmemFds = 1;
-        char fdBuf[CMSG_SPACE(numAshmemFds)];
-        struct msghdr msg = {
-                .msg_control = fdBuf,
-                .msg_controllen = sizeof(fdBuf),
-                .msg_iov = &iov[0],
-                .msg_iovlen = 1,
-        };
-
-        int ret = -1;
-        do {
-            ret = recvmsg(serverSocket, &msg, 0);
-        } while (ret == -1 && errno == EINTR);
-        if (ret == -1) {
-            ret = errno;
-            LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
-            exit(EXIT_FAILURE);
-        }
-
-        if (msg.msg_iovlen != 1) {
-            LOGE("Error reading ashmem handle to socket: bad data length");
-            exit(EXIT_FAILURE);
-        }
-        if (msg.msg_controllen != sizeof(fdBuf)) {
-            LOGE("Error reading ashmem handle to socket: bad fdBuf length");
-            exit(EXIT_FAILURE);
-        }
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        if (!cmsg) {
-            LOGE("Error reading ashmem handle to socket: no fd header");
-            exit(EXIT_FAILURE);
-        }
-
-        const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
-        if (!ashmemFds) {
-            LOGE("Error reading ashmem handle to socket: no fd data");
-            exit(EXIT_FAILURE);
-        }
-        LOGE("Received ashmemFd: %d", ashmemFds[0]);
-
-        shared_buffer = mmap(NULL, NUM_SHARED_MEM_SIZE_BYTES, PROT_READ, MAP_SHARED, ashmemFds[0], 0);
-    } else {
-        AHardwareBuffer *h_buffer = nullptr;
-        int ret = AHardwareBuffer_recvHandleFromUnixSocket(serverSocket, &h_buffer);
-        if (ret != 0) {
-            LOGE("Failed to AHardwareBuffer_recvHandleFromUnixSocket");
-        }
-        ret = AHardwareBuffer_lock(h_buffer, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &shared_buffer);
-    }
-
-    int shared_memory_value = ((int64_t *) shared_buffer)[0];
-    std::ostringstream os;
-    os << "Read " << shared_memory_value << " from shared memory";
-    const char *log = os.str().c_str();
-    LOGE("%s", log);
-
-    std::string value_str = std::to_string(shared_memory_value);
-    return env->NewStringUTF(value_str.c_str());
-}
-
-extern "C"
-JNIEXPORT jobject JNICALL
-Java_ca_utoronto_dsrg_ashmem_demo_server_MainActivity_getAshmemJavaFd(JNIEnv *env, jobject thiz) {
-    // Obtain shared memory type: 1 -> ashmem, 2 -> AHardwarebuffer
-    jclass MainActivityClass = env->GetObjectClass(thiz);
-    jfieldID field_sharedMemoryType = env->GetFieldID(MainActivityClass, "sharedMemoryType", "I");
-    jint sharedMemoryType = env->GetIntField(thiz, field_sharedMemoryType);
-
-    // Configure unix domain socket
-    struct sockaddr_un socketaddr;
-    memset(&socketaddr, 0, sizeof(struct sockaddr_un)); // Clear for safety
-    socketaddr.sun_family = AF_UNIX; // Unix Domain instead of AF_INET IP domain
-    memcpy(&socketaddr.sun_path, DOMAIN_SOCKET_ABSTRACT_NAMESPACE, sizeof(DOMAIN_SOCKET_ABSTRACT_NAMESPACE) - 1);
-    int serverSocket = socket(AF_UNIX, SOCK_STREAM, 0);
-
-    // Connect to the specified unix domain socket
-    LOGD("Connect to the specified unix domain socket");
-    if (connect(serverSocket, (const struct sockaddr *) &socketaddr, sizeof(socketaddr.sun_family) +
-                                                                     sizeof(DOMAIN_SOCKET_ABSTRACT_NAMESPACE) - 1) <
-        0) {
-        LOGE("server connect: %s", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-
-    void *shared_buffer = nullptr;
-    // Receive ashmemFds via SCM_RIGHTS ancillary message
-    // http://man7.org/linux/man-pages/man7/unix.7.html
-    static constexpr size_t kMessageBufferSize = 4096 * sizeof(int);
-    char *kMessageBuf = new char[kMessageBufferSize];
-    struct iovec iov[1];
-    iov[0].iov_base = kMessageBuf;
-    iov[0].iov_len = kMessageBufferSize;
-    const int numAshmemFds = 1;
-    char fdBuf[CMSG_SPACE(numAshmemFds)];
-    struct msghdr msg = {
-            .msg_control = fdBuf,
-            .msg_controllen = sizeof(fdBuf),
-            .msg_iov = &iov[0],
-            .msg_iovlen = 1,
-    };
-
-    int ret = -1;
-    do {
-        ret = recvmsg(serverSocket, &msg, 0);
-    } while (ret == -1 && errno == EINTR);
-    if (ret == -1) {
-        ret = errno;
-        LOGE("Error reading ashmem handle to socket: error %#x (%s)", ret, strerror(ret));
-        exit(EXIT_FAILURE);
-    }
-
-    if (msg.msg_iovlen != 1) {
-        LOGE("Error reading ashmem handle to socket: bad data length");
-        exit(EXIT_FAILURE);
-    }
-    if (msg.msg_controllen != sizeof(fdBuf)) {
-        LOGE("Error reading ashmem handle to socket: bad fdBuf length");
-        exit(EXIT_FAILURE);
-    }
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg) {
-        LOGE("Error reading ashmem handle to socket: no fd header");
-        exit(EXIT_FAILURE);
-    }
-
-    const int *ashmemFds = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
-    if (!ashmemFds) {
-        LOGE("Error reading ashmem handle to socket: no fd data");
-        exit(EXIT_FAILURE);
-    }
-    LOGE("Received ashmemFd: %d", ashmemFds[0]);
-
-    shared_buffer = mmap(NULL, NUM_SHARED_MEM_SIZE_BYTES, PROT_READ, MAP_SHARED, ashmemFds[0], 0);
-    int shared_memory_value = ((int64_t *) shared_buffer)[0];
-    std::ostringstream os;
-    os << "Read " << shared_memory_value << " from shared memory";
-    const char *log = os.str().c_str();
-    LOGE("%s", log);
-
-    jclass fileDescriptorClass = env->FindClass("java/io/FileDescriptor");
-    if (fileDescriptorClass == NULL) {
-        LOGE("Unable to find FileDescriptor class");
-        return NULL;
-    }
-
-    // Construct a new FileDescriptor
-    jmethodID fileDescriptorInitMethodId = env->GetMethodID(fileDescriptorClass, "<init>", "()V");
-    if (fileDescriptorInitMethodId == NULL) {
-        LOGE("Unable to find the <init> method within FileDescriptor class");
-        return NULL;
-    }
-    jobject returnObj = env->NewObject(fileDescriptorClass, fileDescriptorInitMethodId);
-
-    // Poke the "fd" field with the file descriptor. Android renamed "fd" to "descriptor"
-    jfieldID descriptorFieldId = env->GetFieldID(fileDescriptorClass, "descriptor", "I");
-    if (descriptorFieldId == NULL) {
-        LOGE("Unable to find the descriptor member variable within FileDescriptor class <init> method");
-        return NULL;
-    } else {
-        env->SetIntField(returnObj, descriptorFieldId, (jint) ashmemFds[0]);
-    }
-
-    return returnObj;
+    jfieldID mRawSharedMemoryPtrFieldId =
+            env->GetStaticFieldID(MainActivityClass, "mRawSharedMemoryPtr", "J");
+    int64_t* sharedBuffer = (int64_t*) env->GetStaticLongField(MainActivityClass, mRawSharedMemoryPtrFieldId);
+    return (jlong)sharedBuffer[0];
 }

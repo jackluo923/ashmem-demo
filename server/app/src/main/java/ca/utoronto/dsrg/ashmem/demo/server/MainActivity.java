@@ -1,34 +1,29 @@
 package ca.utoronto.dsrg.ashmem.demo.server;
 
-import androidx.appcompat.app.AppCompatActivity;
-
 import android.os.Bundle;
 import android.view.View;
-import android.widget.Button;
-import android.widget.CompoundButton;
 import android.widget.EditText;
-import android.widget.Switch;
 import android.widget.Toast;
 
+import androidx.appcompat.app.AppCompatActivity;
+
 import java.io.FileDescriptor;
-import java.io.FileInputStream;
-import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
+
 
 public class MainActivity extends AppCompatActivity {
-    // sharedMemoryType: 1 -> ashmem 2 -> AHardwareBuffer
-    int sharedMemoryType = 1;   // default ashmem
-    // fdCommunicationType: 1 -> API < 26, 2 -> API >= 26
-    int useNewAPI = 2;   // default use new API
+    private static final String TAG = "MainActivity";
 
-    boolean isDomainSocketServerStated = false;
+    // Shared memory metadata populated by createSharedMemoryRegionNative()
+    static long mRawSharedMemoryPtr = 0L;
+    static int mRawSharedMemoryFd = 0;
+    static FileDescriptor mSharedMemoryFd = null;
 
-    long shared_memory_value = 9000;
-    MappedByteBuffer ashmemBuffer = null;
-    int ashmemFd = -1;
-    Thread domainSocketServer = null;
+    static Thread mDomainSocketServerThread = null;
+
+    static MappedByteBuffer mDirectMappedBuffer = null;
 
     // Used to load the 'native-lib' library on application startup.
     static {
@@ -40,127 +35,65 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Detect shared memory configurations
-        final Switch useAshmemSwitch = findViewById(R.id.useAshmem);
-        final Switch useNewAPISwitch = findViewById(R.id.useNewAPI);
-        final Button readValueViaJavaButton = findViewById(R.id.readValueViaJava);
-        useAshmemSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
-                if (isChecked) {
-                    sharedMemoryType = 1;
-                    useNewAPISwitch.setClickable(true);
-                    readValueViaJavaButton.setClickable(true);
-                    readValueViaJavaButton.setAlpha(1f);
-                } else {
-                    // Shared memory type: AHardwareBuffer
-                    sharedMemoryType = 2;
-                    useNewAPISwitch.setClickable(true);
-                    useNewAPISwitch.setText("Use API >= 26");
-                    readValueViaJavaButton.setClickable(false);
-                    readValueViaJavaButton.setAlpha(.5f);
-                }
-            }
-        });
-        useNewAPISwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
-                if (isChecked) {
-                    useNewAPI = 1;
-                    useNewAPISwitch.setText("Use API >= 26");
-                } else {
-                    useNewAPI = 0;
-                    useNewAPISwitch.setText("Use API < 26");
-                }
-            }
-        });
+        // Create shared memory region
+        createSharedMemoryRegionNative();
 
-        // Initialize domain socket server switch
-        final Switch domainSocketSwitch = findViewById(R.id.domainSocketServer);
-        domainSocketSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
-                if (isChecked) {
-                    domainSocketServer = new Thread() {
-                        public void run() {
-                            ashmemServer();
-                        }
-                    };
-                    domainSocketServer.start();
-                    domainSocketSwitch.setText("On");
-                    isDomainSocketServerStated = true;
-                    domainSocketSwitch.setClickable(false);
-                    useAshmemSwitch.setClickable(false);
-                    useNewAPISwitch.setClickable(false);
-                } else {
-                    domainSocketSwitch.setText("Off");
-                }
+        // Start domain socket server
+        mDomainSocketServerThread = new Thread() {
+            public void run() {
+                domainSocketServerNative();
             }
-        });
+        };
+        mDomainSocketServerThread.start();
     }
 
     public void writeValueInNative(View view) {
-        if(isDomainSocketServerStated == true) {
-            EditText shared_memory_value_str_view = findViewById(R.id.shared_memory_value);
-            String value_str = shared_memory_value_str_view.getText().toString();
-            if (value_str.isEmpty()) {
-                this.shared_memory_value = 9000;
-            } else {
-                this.shared_memory_value = Long.parseLong(shared_memory_value_str_view.getText().toString());
-            }
-            sharedMemoryWriteValueNative();
-            Toast.makeText(getApplicationContext(),
-                    "Wrote to ashmem:" + this.shared_memory_value,
-                    Toast.LENGTH_SHORT).show();
+        EditText targetSharedMemoryValueInput = findViewById(R.id.sharedMemoryValue);
+        String targetSharedMemoryValueStr = targetSharedMemoryValueInput.getText().toString();
+        long sharedMemoryValue;
+        if (targetSharedMemoryValueStr.isEmpty()) {
+            sharedMemoryValue = 9000L;
         } else {
-            Toast.makeText(getApplicationContext(), "Turn on the unix domain socket server",
-                    Toast.LENGTH_SHORT).show();
+            sharedMemoryValue = Long.parseLong(targetSharedMemoryValueInput.getText().toString());
         }
+        writeValueInSharedMemoryNative(sharedMemoryValue);
+        Toast.makeText(getApplicationContext(), "Wrote to " + sharedMemoryValue + " shared memory:",
+                Toast.LENGTH_SHORT).show();
     }
 
-    public void readTimestampInNative(View view) {
-        if(isDomainSocketServerStated == true) {
-            Toast.makeText(getApplicationContext(),
-                    "Read from ashmem:" + ashmemReadTimestampNative(),
-                    Toast.LENGTH_SHORT).show();
-        } else {
-            Toast.makeText(getApplicationContext(), "Turn on the unix domain socket server",
-                    Toast.LENGTH_SHORT).show();
-        }
+    public void readValueInNative(View view) {
+        Toast.makeText(getApplicationContext(), "Read from JNI:" + readValueInSharedMemoryNative(),
+                Toast.LENGTH_SHORT).show();
     }
 
-    public void readTimestampInJava(View view) {
-        if (sharedMemoryType == 1 && isDomainSocketServerStated == true) {
-            if (ashmemBuffer == null) {
-                FileInputStream ashmemFIS = new FileInputStream(getAshmemJavaFd());
-                FileChannel fc = ashmemFIS.getChannel();
-                try {
-                    ashmemBuffer = fc.map(FileChannel.MapMode.READ_ONLY, 0, 8);
-                    ashmemBuffer.order(ByteOrder.LITTLE_ENDIAN);
-                    ashmemBuffer.load();
-                    Toast.makeText(getApplicationContext(),
-                            "Read from ashmem:" + ashmemBuffer.getLong(0),
-                            Toast.LENGTH_SHORT).show();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            } else {
-                ashmemBuffer.rewind();
-                Toast.makeText(getApplicationContext(),
-                        "Read from ashmem 2nd time:" + ashmemBuffer.getLong(0),
-                        Toast.LENGTH_SHORT).show();
+    public void readValueInJava(View view) {
+        if (mDirectMappedBuffer == null) {
+            try {
+                // Accessing hidden methods via reflection requires "ChickenHook" package which works for API 19-30
+                // https://github.com/ChickenHook/RestrictionBypass
+                final Class<?> directByteBufferClass = Class.forName("java.nio.DirectByteBuffer");
+                final Constructor<?> directByteBufferConstructor = directByteBufferClass.getConstructor(int.class,
+                        long.class, FileDescriptor.class, Runnable.class, boolean.class);
+                mDirectMappedBuffer = (MappedByteBuffer)directByteBufferConstructor.newInstance(Long.BYTES,
+                        mRawSharedMemoryPtr, mSharedMemoryFd, null, true);   // READ-ONLY Direct Mapped Buffer
+                mDirectMappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
+                mDirectMappedBuffer.load();
+            } catch (Exception e) {
+                e.printStackTrace();
+                return;
             }
         } else {
-            Toast.makeText(getApplicationContext(), "Turn on the unix domain socket server",
-                    Toast.LENGTH_SHORT).show();
+            mDirectMappedBuffer.rewind();
         }
+        long sharedBufferValue = mDirectMappedBuffer.getLong();
+        Toast.makeText(getApplicationContext(), "Read from direct mapped buffer:" + sharedBufferValue,
+                Toast.LENGTH_SHORT).show();
     }
 
-    public native void ashmemServer();
 
-    public native void sharedMemoryWriteValueNative();
-
-    public native String ashmemReadTimestampNative();
-
-    public native FileDescriptor getAshmemJavaFd();
+    public native void createSharedMemoryRegionNative();
+    public native void domainSocketServerNative();
+    public native void writeValueInSharedMemoryNative(long sharedMemoryValue);
+    public native long readValueInSharedMemoryNative();
 }
+
